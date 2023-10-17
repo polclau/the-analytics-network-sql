@@ -2,19 +2,143 @@
 
 -- 1.Crear una vista con el resultado del ejercicio donde unimos la cantidad de gente que ingresa a tienda usando los dos sistemas.(tablas market_count y super_store_count)
 -- . Nombrar a la lista `stg.vw_store_traffic`
--- . Las columnas son `store_id`, `date`, `traffic`
+-- . Las columnas son `store_id`, `date`, `traffic`CREATE VIEW stg.vw_store_traffic AS
+SELECT store_id, TO_DATE(date, 'YYYYMMDD') AS date, traffic
+FROM (
+    SELECT store_id, CAST(date AS VARCHAR) AS date, traffic FROM stg.super_store_count
+    UNION ALL
+    SELECT store_id, date::VARCHAR, traffic FROM stg.market_count
+) AS combined_traffic;
+
 
 -- 2. Recibimos otro archivo con ingresos a tiendas de meses anteriores. Subir el archivo a stg.super_store_count_aug y agregarlo a la vista del ejercicio anterior. Cual hubiese sido la diferencia si hubiesemos tenido una tabla? (contestar la ultima pregunta con un texto escrito en forma de comentario)
 
 -- 3. Crear una vista con el resultado del ejercicio del ejercicio de la Parte 1 donde calculamos el margen bruto en dolares. Agregarle la columna de ventas, promociones, creditos, impuestos y el costo en dolares para poder reutilizarla en un futuro. Responder con el codigo de creacion de la vista.
 -- El nombre de la vista es stg.vw_order_line_sale_usd
 -- Los nombres de las nuevas columnas son sale_usd, promotion_usd, credit_usd, tax_usd, y line_cost_usd
+CREATE VIEW stg.vw_order_line_sale_usd AS
+WITH order_line_Sale_dollars AS (
+    SELECT
+        os.order_number,
+        os.product,
+        CAST(date_trunc('month', os.date) AS DATE) AS date,
+        CASE
+            WHEN currency = 'EUR' THEN sale / fx_rate_usd_eur
+            WHEN currency = 'ARS' THEN sale / fx_rate_usd_peso
+            WHEN currency = 'URU' THEN sale / fx_rate_usd_URU
+            ELSE sale
+        END AS sale_usd,
+        CASE
+            WHEN os.promotion IS NULL THEN 0
+            WHEN currency = 'EUR' THEN os.promotion / fx_rate_usd_eur
+            WHEN currency = 'ARS' THEN os.promotion / fx_rate_usd_peso
+            WHEN currency = 'URU' THEN os.promotion / fx_rate_usd_URU
+            ELSE os.promotion
+        END AS promotion_usd,
+        CASE
+            WHEN os.tax IS NULL THEN 0
+            WHEN currency = 'EUR' THEN os.tax / fx_rate_usd_eur
+            WHEN currency = 'ARS' THEN os.tax / fx_rate_usd_peso
+            WHEN currency = 'URU' THEN os.tax / fx_rate_usd_URU
+            ELSE os.tax
+        END AS tax_usd,
+        CASE
+            WHEN os.credit IS NULL THEN 0
+            WHEN currency = 'EUR' THEN os.credit / fx_rate_usd_eur
+            WHEN currency = 'ARS' THEN os.credit / fx_rate_usd_peso
+            WHEN currency = 'URU' THEN os.credit / fx_rate_usd_URU
+            ELSE os.credit
+        END AS credit_usd,
+        (c.product_cost_usd * os.quantity) AS line_cost_usd
+    FROM
+        stg.order_line_sale os
+        LEFT JOIN stg.monthly_average_fx_rate mr ON date_trunc('month', mr.month)::DATE = date_trunc('month', os.date)::DATE
+        LEFT JOIN stg.cost c ON c.product_code = os.product
+)
+SELECT
+    *,
+    sale_usd - promotion_usd - line_cost_usd AS margin_usd
+FROM
+    order_line_Sale_dollars;
+
 
 -- 4. Generar una query que me sirva para verificar que el nivel de agregacion de la tabla de ventas (y de la vista) no se haya afectado. Recordas que es el nivel de agregacion/detalle? Lo vimos en la teoria de la parte 1! Nota: La orden M202307319089 parece tener un problema verdad? Lo vamos a solucionar mas adelante.
+-- Para la tabla de ventas
+WITH stg_sales AS (
+    SELECT 
+        order_number,
+        product,
+        row_number() OVER (PARTITION BY order_number, product ORDER BY product ASC) AS rn
+    FROM
+        stg.order_line_sale
+)
+SELECT *
+FROM stg_sales
+WHERE rn > 1;
+
+-- Para la vista
+WITH stg_vw_sales AS (
+    SELECT 
+        order_number,
+        product,
+        row_number() OVER (PARTITION BY order_number, product ORDER BY product ASC) AS rn
+    FROM
+        stg.vw_order_line_sale_usd
+)
+SELECT *
+FROM stg_vw_sales
+WHERE rn > 1;
 
 -- 5. Calcular el margen bruto a nivel Subcategoria de producto. Usar la vista creada stg.vw_order_line_sale_usd. La columna de margen se llama margin_usd
+WITH SubcategoryMargins AS (
+    SELECT
+        pm.subcategory,
+        SUM(vwos.margin_usd) AS margin_usd
+    FROM
+        stg.vw_order_line_sale_usd vwos
+        LEFT JOIN stg.product_master pm ON vwos.product = pm.product_code
+    GROUP BY
+        pm.subcategory
+)
+
+SELECT * FROM SubcategoryMargins;
 
 -- 6. Calcular la contribucion de las ventas brutas de cada producto al total de la orden.
+WITH total_sale_usd_by_order_number AS (
+    SELECT
+        order_number,
+        SUM(sale_usd) AS sale_usd_by_order
+    FROM
+        stg.vw_order_line_sale_usd vwos
+    GROUP BY
+        order_number
+    ORDER BY
+        order_number
+),
+total_sale_usd_by_order_number_and_product AS (
+    SELECT
+        order_number,
+        product,
+        SUM(sale_usd) AS sale_usd
+    FROM
+        stg.vw_order_line_sale_usd vwos
+    GROUP BY
+        order_number,
+        product
+    ORDER BY
+        order_number
+)
+SELECT
+    top.*,
+    ot.sale_usd_by_order,
+    (top.sale_usd / ot.sale_usd_by_order) AS contri_usd_sale
+FROM
+    total_sale_usd_by_order_number_and_product top
+LEFT JOIN
+    total_sale_usd_by_order_number ot ON ot.order_number = top.order_number
+ORDER BY
+    top.order_number
+LIMIT 10; -- Limitar a los primeros 10 resultados (o ajustar según sea necesario)
 
 -- 7. Calcular las ventas por proveedor, para eso cargar la tabla de proveedores por producto. Agregar el nombre el proveedor en la vista del punto stg.vw_order_line_sale_usd. El nombre de la nueva tabla es stg.suppliers
 
